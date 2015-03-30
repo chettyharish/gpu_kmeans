@@ -167,7 +167,6 @@ __global__ void generate_new_center2(float *d_points, float *d_centers, int *d_c
 			start -> 13 , 14 , 15 , 16
 			diff  ->  3  , 2  , 1  , 0
 			*/
-			__syncthreads();
 			int max_length;
 			int end_point = (j + 1)*split_size - 1;
 			if (end_point <= clusterDimension - 1){
@@ -179,29 +178,48 @@ __global__ void generate_new_center2(float *d_points, float *d_centers, int *d_c
 
 			/*Collabaratively Load 0's in shared memory!*/
 			/*Each thread 0's out ele_to_zero entries*/
-			int ele_to_zero = ceil((48 * 1024) / (4.0 * blockDim.x));
-			if (tx == 0){
+			int total_ele = (48 * 1024) / (4);
+			int ele_to_zero = (int)ceil(total_ele *1.0f / blockDim.x);
+
+
+			/*if (tx == 0){
 				for (int k = 0; k < 48 * 1024 / 4; k++){
 					s_centers[k] = 0;
 				}
+			}*/
+
+
+			for (int k = tx*ele_to_zero; k < (tx + 1)*ele_to_zero; k++){
+				if (k < total_ele)
+					s_centers[k] = 0;
 			}
-
-
-
 			__syncthreads();
 
 			for (int k = 0; k < max_length; k++){
-				atomicAdd(&s_centers[max_length*clusterId + k], points[k]);
+				atomicAdd(&s_centers[max_length*clusterId + k], points[j*split_size+k]);
 			}
 			__syncthreads();
 
+
+			/*Collabaratively write back to d_centers!*/
+			
+			int clus = ceil(1.0f*numClusters / blockDim.x);
+			for (int l = tx*clus; l < (tx + 1)*clus; l++){
+			if (l < numClusters)
+			for (int k = 0; k < max_length; k++){
+			atomicAdd(&d_centers[j*split_size + clusterDimension*l + k], s_centers[max_length*l + k]);
+			}
+			}
+
+
+			/*
 			if (tx == 0){
 				for (int l = 0; l < numClusters; l++){
 					for (int k = 0; k < max_length; k++){
 						atomicAdd(&d_centers[j*split_size + clusterDimension*l + k], s_centers[max_length*l + k]);
 					}
 				}
-			}
+			}*/
 
 			__syncthreads();
 
@@ -346,7 +364,7 @@ int main(int argc, char **argv){
 
 		clk1 = microtime();
 		//generate_new_center << <NumBlocks, ThreadsPerBlock >> >(d_points, d_centers, d_clusterIdx, d_member_counter);
-		//cudaThreadSynchronize();
+
 		generate_new_center2 << <NumBlocks, ThreadsPerBlock, smem_size >> >(d_points, d_centers, d_clusterIdx, d_member_counter, split_steps, split_size);
 
 		cudaThreadSynchronize();

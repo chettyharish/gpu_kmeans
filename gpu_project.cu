@@ -350,11 +350,8 @@ int main(int argc, char **argv){
 	cudaThreadSynchronize();
 
 	int count = 0;
-	while (count< iterations)
 	/*Each co-ordinate has a change less than 0.001 on average!*/
-	//while (diff_norm > (numPoints*clusterDimension) / 1000.0){
-		while (diff_norm > numClusters){
-		//while (count < 2){
+	while (diff_norm > (numPoints*clusterDimension) / 1000.0){
 		clk1 = microtime();
 
 		for (int i = 0; i < numPoints; i++){

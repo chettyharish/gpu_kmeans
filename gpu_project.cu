@@ -12,8 +12,8 @@
 #define iterations 10						// Max times to run kmeans
 #define convergecount 20					// Max kmeans step to avoid flip-flops
 #define clusterDimension 16
-#define numPoints (1024*1024)
-#define numClusters (1024*3)
+#define numPoints (1*1024*1024)
+#define numClusters (1024)
 #define FLOAT_MAX 1e+37
 #define ConstantMemFloats (64*1024)/4			//	64KB/4
 #define rand_range 100
@@ -251,6 +251,29 @@ __global__ void generate_new_center_transpose(float *d_points, float *d_centers,
 
 }
 
+__global__ void add_array(float *d_mindistances)
+{
+	const int threads_per_block = 1024;
+	__shared__ float partialSum[2 * threads_per_block];
+	int idx = threadIdx.x;
+	int start = 2 * blockIdx.x * threads_per_block;
+	if (start < numPoints){
+		partialSum[idx] = d_mindistances[start + idx];
+		if (start + threads_per_block < numPoints)
+			partialSum[idx + threads_per_block] = d_mindistances[start + idx + threads_per_block];
+		else
+			partialSum[idx + threads_per_block] = 0;
+
+		for (unsigned int stride = threads_per_block; stride >= 1; stride >>= 1)
+		{
+			__syncthreads();
+			if (idx < stride)
+				partialSum[idx] += partialSum[idx + stride];
+		}
+
+		d_mindistances[start + idx] = partialSum[idx];
+	}
+}
 
 int main(int argc, char **argv){
 
@@ -291,7 +314,6 @@ int main(int argc, char **argv){
 		max_cached = (int)floor(64 * 1024 * 1.0f / (clusterDimension * 4));
 	}
 
-	max_cached /= 1;
 	distance_steps = (int)ceil(numClusters*1.0f / max_cached*1.0f);
 	printf("Calculations for max_distance() function!\n");
 	printf("numClusters = %d \tThreadsPerBlock = %d \t NumBlocks = %d\t smem_size = %d\n", numClusters, ThreadsPerBlock, NumBlocks, smem_size);
@@ -328,7 +350,7 @@ int main(int argc, char **argv){
 
 	cudaMemcpy(d_points, h_points, clusterDimension*numPoints*sizeof(float), cudaMemcpyHostToDevice);
 
-	cudaThreadSynchronize();
+	cudaDeviceSynchronize();
 
 	int count = 0;
 	int con_count = 0;
@@ -339,22 +361,15 @@ int main(int argc, char **argv){
 		kmeansclk1 = microtime();
 		while (diff_norm >(numPoints*clusterDimension) / 1000.0 && con_count < convergecount ){
 			printf("\nIteration = %d \t Ccount = %d\n", count, con_count);
-
 			clk1 = microtime();
-
-			for (int i = 0; i < numPoints; i++){
-				h_clusterIdx[i] = INT_MAX;
-				h_mindistances[i] = (float)FLOAT_MAX;
-			}
-			memset(h_member_counter, 0, numClusters*sizeof(int));
-			clk2 = microtime();
-			printf("PART 0 :Time = %g µs\n", (double)(clk2 - clk1));
-
-			clk1 = microtime();
+			cudaMemset(d_clusterIdx, 1, numPoints*sizeof(int));
+			cudaMemset(d_mindistances, 99, numPoints*sizeof(float));
+			cudaMemset(d_member_counter, 0, numClusters*sizeof(int));
+			/*
 			cudaMemcpy(d_clusterIdx, h_clusterIdx, numPoints*sizeof(int), cudaMemcpyHostToDevice);
 			cudaMemcpy(d_mindistances, h_mindistances, numPoints*sizeof(float), cudaMemcpyHostToDevice);
-			cudaMemcpy(d_member_counter, h_member_counter, numClusters*sizeof(int), cudaMemcpyHostToDevice);
-			cudaThreadSynchronize();
+			cudaMemcpy(d_member_counter, h_member_counter, numClusters*sizeof(int), cudaMemcpyHostToDevice);*/
+			cudaDeviceSynchronize();
 			clk2 = microtime();
 			printf("PART 1 :Time = %g µs\n", (double)(clk2 - clk1));
 
@@ -363,13 +378,13 @@ int main(int argc, char **argv){
 				//To adjust for last iteration!
 				int num_copy = (max_cached <= numClusters - step*max_cached) ? max_cached : numClusters - step*max_cached;
 				cudaMemcpyToSymbol(d_cons_centers, h_centers_new + step*max_cached*clusterDimension, clusterDimension*num_copy*sizeof(float));
-				cudaThreadSynchronize();
+				cudaDeviceSynchronize();
 				calc_distance_mixed << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_clusterIdx,
 					d_mindistances, step, num_copy, max_cached);
-				cudaThreadSynchronize();
+				cudaDeviceSynchronize();
 
 
-				printf("num_cpy = %d\tcalc_distance_mixed: %s\n", num_copy, cudaGetErrorString(cudaGetLastError()));
+				//printf("num_cpy = %d\tcalc_distance_mixed: %s\n", num_copy, cudaGetErrorString(cudaGetLastError()));
 			}
 			clk2 = microtime();
 			printf("PART 2 :Time = %g µs\n", (double)(clk2 - clk1));
@@ -377,25 +392,26 @@ int main(int argc, char **argv){
 			clk1 = microtime();
 			cudaMemset(d_centers, 0, clusterDimension*numClusters*sizeof(float));
 			generate_new_center_transpose << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_centers, d_clusterIdx, d_member_counter);
-			cudaThreadSynchronize();
-			printf("generate_new_center_transpose: %s\n", cudaGetErrorString(cudaGetLastError()));
+			cudaDeviceSynchronize();
+			//printf("generate_new_center_transpose: %s\n", cudaGetErrorString(cudaGetLastError()));
 			clk2 = microtime();
 			printf("PART 3 :Time = %g µs\n", (double)(clk2 - clk1));
 
 			clk1 = microtime();
 			cudaMemcpy(h_centers_new, d_centers, clusterDimension*numClusters*sizeof(float), cudaMemcpyDeviceToHost);
 			cudaMemcpy(h_member_counter, d_member_counter, numClusters*sizeof(int), cudaMemcpyDeviceToHost);
-			cudaThreadSynchronize();
+			cudaDeviceSynchronize();
 			clk2 = microtime();
 			printf("PART 4 :Time = %g µs\n", (double)(clk2 - clk1));
 
 			clk1 = microtime();
+			/*
 			int zero_count = 0;
 			for (int i = 0; i < numClusters; i++){
 				if (h_member_counter[i] == 0)
 					zero_count++;
 			}
-			printf("Zero Count = %d\n", zero_count);
+			printf("Zero Count = %d\n", zero_count);*/
 			member_division(h_centers_new, h_member_counter);
 			diff_norm = calculate_norm(h_centers_old, h_centers_new);
 			copy_centers(h_centers_old, h_centers_new);
@@ -407,19 +423,28 @@ int main(int argc, char **argv){
 		kmeansclk2 = microtime();
 		printf("Kmeans Total Time = %g seconds\n\n", (double)((kmeansclk2 - kmeansclk1) / 1000000));
 
+#if numPoints > 64*1024*1024
+		add_array << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_mindistances);
 		cudaMemcpy(h_mindistances, d_mindistances, numPoints*sizeof(float), cudaMemcpyDeviceToHost);
-		cudaThreadSynchronize();
-
+		cudaDeviceSynchronize();
+		for (int i = 0; i < (int)ceil(numPoints / 1024.0); i++){
+			RSS_score += h_mindistances[i * 2 * 1024];
+		}
+#else
+		cudaMemcpy(h_mindistances, d_mindistances, numPoints*sizeof(float), cudaMemcpyDeviceToHost);
+		cudaDeviceSynchronize();
 		for (int i = 0; i < numPoints; i++){
 			RSS_score += h_mindistances[i];
 		}
+#endif
 		printf("Iteration = %d\t RSS_score is : %f\n", count, RSS_score);
+
 
 		if (RSS_score < minRSS_score){
 			/*Storing back the clusters which exhibit the lowest RSS_score*/
 			minRSS_score = RSS_score;
 			cudaMemcpy(h_min_RSS_clusterIdx, d_clusterIdx, numPoints*sizeof(int), cudaMemcpyDeviceToHost);
-			cudaThreadSynchronize();
+			cudaDeviceSynchronize();
 
 		}
 		RSS_score = 0.0;

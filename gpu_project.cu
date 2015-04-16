@@ -9,13 +9,14 @@
 #include <math.h>
 #include <time.h>
 
-#define iterations 10						// Max times to run kmeans
+#define iterations 1						// Max times to run kmeans
 #define convergecount 20					// Max kmeans step to avoid flip-flops
 #define clusterDimension 16
 #define numPoints (1*1024*1024)
 #define numClusters (1024)
 #define FLOAT_MAX 1e+37
 #define ConstantMemFloats (64*1024)/4			//	64KB/4
+#define SharedMemFloats (24*1024)/4				//	24KB/4 
 #define rand_range 100
 
 
@@ -35,8 +36,216 @@ double microtime(void)
 #endif
 
 
-
 __constant__ float d_cons_centers[ConstantMemFloats];
+
+////////////////////////////////////////////////////////////////////////
+////////////////////////UNUSED CODE/////////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+__host__ void generate_random_points_unused(float *h_points){
+
+	//Randomly generating points using rand()
+	srand((unsigned int)time(0));
+	int count = 0;
+	for (int i = 0; i < numPoints; i++){
+		for (int j = 0; j < clusterDimension; j++)
+		{
+			h_points[i*clusterDimension + j] = (float)(count++);
+		}
+	}
+
+}
+
+
+__host__ void generate_random_centers_unused(float *h_points, float *h_centers_old, float *h_centers_new){
+	//Selecting random points using Floyd's Algorithm
+	int *rand_idx = (int *)malloc(numClusters*sizeof(int));
+	int *flag = (int *)malloc(numPoints*sizeof(int));
+
+	memset(rand_idx, 0, numClusters*sizeof(int));
+	memset(flag, 0, numPoints*sizeof(int));
+
+	int n = numPoints;
+	int m = 0;
+	for (n = (numPoints - numClusters); n < numPoints && m < numClusters; n++, m++){
+		int r = rand() % (n + 1);
+
+		if (flag[r] == 1){
+			/*Works since previous iteration had rand() % n , and thus
+			it is not possible that n was chosen!*/
+			r = n;
+		}
+		rand_idx[m] = r;
+		flag[r] = 1;
+	}
+
+
+	for (int i = 0; i < numClusters; i++){
+		for (int j = 0; j < clusterDimension; j++)
+		{
+			h_centers_old[i*clusterDimension + j] = h_points[rand_idx[i] * clusterDimension + j];
+			h_centers_new[i*clusterDimension + j] = h_points[rand_idx[i] * clusterDimension + j];
+		}
+	}
+}
+
+//Costs 500 µ seconds! do not use!
+__device__ float distance_func(float *point1, float *point2){
+	float distance = 0.0f;
+	for (int k = 0; k < clusterDimension; k++){
+		distance += sqrtf((point1[k] - point2[k]) * (point1[k] - point2[k]));
+	}
+	return distance;
+
+}
+
+/*Points in registers and getting the centers from global memory*/
+__global__ void calc_distance0_unused(float *d_centers, float *d_points, int *d_clusterIdx, float *d_mindistances){
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	int min_pos = -1;
+	if (i < numPoints){
+		float min_dist = d_mindistances[i];
+		float points[clusterDimension];
+		for (int j = 0; j < clusterDimension; j++){
+			points[j] = d_points[i*clusterDimension + j];
+		}
+
+
+		for (int k = 0; k < numClusters; k++){
+			float distance = 0.0f;
+			for (int j = 0; j < clusterDimension; j++){
+				distance += fabsf(points[j] - d_centers[k*clusterDimension + j]);
+			}
+
+			if (distance < min_dist){
+				min_dist = distance;
+				min_pos = k;
+			}
+		}
+
+		d_mindistances[i] = min_dist;
+		d_clusterIdx[i] = min_pos;
+	}
+}
+
+/*Points in shared memory and centers in constant memory*/
+__global__ void calc_distance1_unused(float *d_points, int *d_clusterIdx, float *d_mindistances, int step, int num_copy, int max_cached){
+
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	int tx = threadIdx.x;
+	int min_pos = -1;
+	extern __shared__ float s_points[];
+
+	/*Getting the value from previous iterations*/
+	if (i < numPoints){
+		float min_dist = d_mindistances[i];
+		float old_min_dist = d_mindistances[i];
+
+		for (int j = 0; j < clusterDimension; j++){
+			s_points[tx*clusterDimension + j] = d_points[i*clusterDimension + j];
+		}
+
+		for (int k = 0; k < num_copy; k++){
+			float distance = 0.0f;
+			for (int j = 0; j < clusterDimension; j++){
+				distance += fabsf(s_points[tx*clusterDimension + j] - d_cons_centers[k*clusterDimension + j]);
+			}
+
+			if (distance < min_dist){
+				min_dist = distance;
+				min_pos = k;
+			}
+		}
+
+		/*Only update if there were changes!!*/
+		if (min_dist < old_min_dist){
+			d_mindistances[i] = min_dist;
+			d_clusterIdx[i] = step*max_cached + min_pos;
+		}
+	}
+}
+
+
+/*
+Points in registers and centers in constant memory
+*/
+__global__ void calc_distance2_unused(float *d_points, int *d_clusterIdx, float *d_mindistances, int step, int num_copy, int max_cached){
+
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	int min_pos = -1;
+
+	/*Getting the value from previous iterations*/
+	if (i < numPoints){
+		float points[clusterDimension];
+		for (int j = 0; j < clusterDimension; j++){
+			points[j] = d_points[i*clusterDimension + j];
+		}
+		float min_dist = d_mindistances[i];
+		float old_min_dist = d_mindistances[i];
+
+		for (int k = 0; k < num_copy; k++){
+			float distance = 0.0f;
+			for (int j = 0; j < clusterDimension; j++){
+				distance += fabsf(points[j] - d_cons_centers[k*clusterDimension + j]);
+			}
+
+			if (distance < min_dist){
+				min_dist = distance;
+				min_pos = k;
+			}
+		}
+
+		/*Only update if there were changes!!*/
+		if (min_dist < old_min_dist){
+			d_mindistances[i] = min_dist;
+			d_clusterIdx[i] = step*max_cached + min_pos;
+		}
+	}
+}
+
+/*Trying to read from adjacent locations in constant memory
+Using magic index as a stride aligner*/
+__global__ void calc_distance_transpose_unused(float *d_points, int *d_clusterIdx, float *d_mindistances, int step, int num_copy, int max_cached){
+
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	int tx = threadIdx.x;
+	int min_pos = -1;
+
+	/*Getting the value from previous iterations*/
+	if (i < numPoints){
+		float points[clusterDimension];
+		for (int j = 0; j < clusterDimension; j++){
+			points[j] = d_points[j*numPoints + i];
+		}
+		float min_dist = d_mindistances[i];
+		float old_min_dist = d_mindistances[i];
+
+		/*Forcing adjacent accesses by number magic :)*/
+		for (int k = 0; k < num_copy; k++){
+			int magic = (tx + k) % num_copy;
+			float distance = 0.0f;
+			for (int j = 0; j < clusterDimension; j++){
+				distance += fabsf(points[j] - d_cons_centers[j*num_copy + magic]);
+			}
+
+			if (distance < min_dist){
+				min_dist = distance;
+				min_pos = magic;
+			}
+		}
+
+		/*Only update if there were changes!!*/
+		if (min_dist < old_min_dist){
+			d_mindistances[i] = min_dist;
+			d_clusterIdx[i] = step*max_cached + min_pos;
+		}
+	}
+}
+
+////////////////////////////////////////////////////////////////////////
+////////////////////////UNUSED CODE ENDS///////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
 
 __host__ void printDeviceInfo(){
 	FILE * fp;
@@ -78,34 +287,10 @@ __host__ void generate_random_points_transpose(float *h_points){
 	for (int j = 0; j < clusterDimension; j++)
 	{
 		for (int i = 0; i < numPoints; i++){
-			h_points[j*numPoints + i] =  (float)(rand() % rand_range);
+			h_points[j*numPoints + i] = (float)(rand() % rand_range);
 			h_points[j*numPoints + i] = (float)(count++);
 		}
 	}
-
-
-	/*int flagger = 0;
-	int sameCount = 0;
-	for (int k = 0; k < numClusters; k++){
-		for (int i = 0; i < numClusters; i++){
-			flagger = 0;
-			for (int j = 0; j < clusterDimension; j++){
-				if (!(h_points[j*numPoints + k] == h_points[j*numPoints + i])){
-					flagger = 1;
-				}
-			}
-
-			if (k == i)
-				flagger = 1;
-
-			if (flagger == 0){
-				sameCount++;
-			}
-		}
-	}
-
-	printf("SAME POINTS = %d\n", sameCount);*/
-
 }
 
 __host__ void generate_random_centers_transpose(float *h_points, float *h_centers_old, float *h_centers_new){
@@ -138,31 +323,6 @@ __host__ void generate_random_centers_transpose(float *h_points, float *h_center
 			h_centers_new[i*clusterDimension + j] = h_points[j*numPoints + rand_idx[i]];
 		}
 	}
-
-	/*int flagger = 0;
-	int sameCount = 0;
-
-	for (int k = 0; k < numClusters; k++){
-		for (int i = 0; i < numClusters; i++){
-			flagger = 0;
-			for (int j = 0; j < clusterDimension; j++){
-				if (!(h_centers_new[k*clusterDimension + j] == h_centers_new[i*clusterDimension + j])){
-					flagger = 1;
-				}
-			}
-
-			if (k == i)
-				flagger = 1;
-
-			if (flagger == 0){
-				sameCount++;
-			}
-		}
-	}
-
-
-	printf("SAME CENTERS  = %d\n", sameCount);*/
-
 
 }
 
@@ -204,12 +364,12 @@ A modified kernel which tries to take advantage of both the orders
 Uses column ordering for points and row ordering for centers
 */
 
-__global__ void calc_distance_mixed(float *d_points, int *d_clusterIdx, float *d_mindistances, int step, int num_copy, int max_cached){
+__global__ void calc_distance_constant(float *d_points, int *d_clusterIdx, float *d_mindistances, int step_constant, int num_copy_constant, int max_cached_constant){
 
 	int i = blockDim.x*blockIdx.x + threadIdx.x;
 
 	/*Getting the value from previous iterations*/
-	if (i < numPoints){ 
+	if (i < numPoints){
 		int min_pos = -1;
 		float points[clusterDimension];
 		for (int j = 0; j < clusterDimension; j++){
@@ -218,7 +378,7 @@ __global__ void calc_distance_mixed(float *d_points, int *d_clusterIdx, float *d
 		float min_dist = d_mindistances[i];
 		float old_min_dist = d_mindistances[i];
 
-		for (int k = 0; k < num_copy; k++){
+		for (int k = 0; k < num_copy_constant; k++){
 			float distance = 0.0f;
 			for (int j = 0; j < clusterDimension; j++){
 				distance += fabsf(points[j] - d_cons_centers[k*clusterDimension + j]);
@@ -230,14 +390,58 @@ __global__ void calc_distance_mixed(float *d_points, int *d_clusterIdx, float *d
 			}
 		}
 
-		
+
 		/*Only update if there were changes!!*/
 		if (min_dist < old_min_dist){
 			d_mindistances[i] = min_dist;
-			d_clusterIdx[i] = step*max_cached + min_pos;
+			d_clusterIdx[i] = step_constant*max_cached_constant + min_pos;
 		}
 	}
 }
+
+__global__ void calc_distance_shared(float *d_points, float *d_centers, int *d_clusterIdx, float *d_mindistances, int step_shared, int num_copy_shared, int max_cached_shared){
+
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	int tx = threadIdx.x;
+	extern __shared__ float s_centers[];
+
+
+	if (tx < max_cached_shared){
+		for (int j = 0; j < clusterDimension; j++){
+			s_centers[tx*clusterDimension + j] = d_centers[step_shared*max_cached_shared*clusterDimension + tx*clusterDimension + j];
+		}
+	}
+
+
+	if (i < numPoints){
+		int min_pos = -1;
+		float min_dist = d_mindistances[i];
+		float old_min_dist = d_mindistances[i];
+
+		float points[clusterDimension];
+		for (int j = 0; j < clusterDimension; j++){
+			points[j] = d_points[j*numPoints + i];
+		}
+
+		/*for (int k = 0; k < num_copy; k++){
+			float distance = 0.0f;
+			for (int j = 0; j < clusterDimension; j++){
+				distance += fabsf(s_points[tx*clusterDimension + j] - d_cons_centers[k*clusterDimension + j]);
+			}
+
+			if (distance < min_dist){
+				min_dist = distance;
+				min_pos = k;
+			}
+		}
+
+		if (min_dist < old_min_dist){
+			d_mindistances[i] = min_dist;
+			d_clusterIdx[i] = step*max_cached + min_pos;
+		}*/
+	}
+}
+
 
 __global__ void generate_new_center_transpose(float *d_points, float *d_centers, int *d_clusterIdx, int * d_member_counter){
 	int i = blockDim.x*blockIdx.x + threadIdx.x;
@@ -304,20 +508,20 @@ int main(int argc, char **argv){
 	int smem_size = ThreadsPerBlock*clusterDimension*sizeof(float);
 
 	/*Constant memory max fitting*/
-	int max_cached, distance_steps;
+	int max_cached_constant, distance_steps_constant;
 	if (numClusters*clusterDimension * 4.0 <= 64 * 1024 * 1.0f){
 		/*I can fit all the centers!*/
-		max_cached = numClusters;
+		max_cached_constant = numClusters;
 	}
 	else{
 		/*One Point takes clusterDimension*4 memory , how mant can I fit in 64k?*/
-		max_cached = (int)floor(64 * 1024 * 1.0f / (clusterDimension * 4));
+		max_cached_constant = (int)floor(64 * 1024 * 1.0f / (clusterDimension * 4));
 	}
 
-	distance_steps = (int)ceil(numClusters*1.0f / max_cached*1.0f);
+	distance_steps_constant = (int)ceil(numClusters*1.0f / max_cached_constant*1.0f);
 	printf("Calculations for max_distance() function!\n");
 	printf("numClusters = %d \tThreadsPerBlock = %d \t NumBlocks = %d\t smem_size = %d\n", numClusters, ThreadsPerBlock, NumBlocks, smem_size);
-	printf("max_cached %d\t distance_steps %d\n\n", max_cached, distance_steps);
+	printf("max_cached %d\t distance_steps %d\n\n", max_cached_constant, distance_steps_constant);
 
 	//Calculations for generate_new_centers()
 	int split_size = (int)floor((48 * 1024) / (numClusters * 4.0f));
@@ -331,7 +535,7 @@ int main(int argc, char **argv){
 	/*Need two arrays one for old centers, and one for new  for calculating NORM*/
 	float *h_centers_old = (float *)malloc(clusterDimension*numClusters*sizeof(float));
 	float *h_centers_new = (float *)malloc(clusterDimension*numClusters*sizeof(float));
-	float *h_centers_transpose = (float *)malloc(clusterDimension*max_cached*sizeof(float));
+	float *h_centers_transpose = (float *)malloc(clusterDimension*max_cached_constant*sizeof(float));
 
 	/*Stores cluster indexes of all the points*/
 	float *h_mindistances = (float *)malloc(numPoints*sizeof(float));
@@ -359,7 +563,7 @@ int main(int argc, char **argv){
 		generate_random_centers_transpose(h_points, h_centers_old, h_centers_new);
 		/*Each co-ordinate has a change less than 0.001 on average!*/
 		kmeansclk1 = microtime();
-		while (diff_norm >(numPoints*clusterDimension) / 1000.0 && con_count < convergecount ){
+		while (diff_norm >(numPoints*clusterDimension) / 1000.0 && con_count < convergecount){
 			printf("\nIteration = %d \t Ccount = %d\n", count, con_count);
 			clk1 = microtime();
 			cudaMemset(d_clusterIdx, 1, numPoints*sizeof(int));
@@ -374,13 +578,13 @@ int main(int argc, char **argv){
 			printf("PART 1 :Time = %g µs\n", (double)(clk2 - clk1));
 
 			clk1 = microtime();
-			for (int step = 0; step < distance_steps; step++){
+			for (int step_constant = 0; step_constant < distance_steps_constant; step_constant++){
 				//To adjust for last iteration!
-				int num_copy = (max_cached <= numClusters - step*max_cached) ? max_cached : numClusters - step*max_cached;
-				cudaMemcpyToSymbol(d_cons_centers, h_centers_new + step*max_cached*clusterDimension, clusterDimension*num_copy*sizeof(float));
+				int num_copy_constant = (max_cached_constant <= numClusters - step_constant*max_cached_constant) ? max_cached_constant : numClusters - step_constant*max_cached_constant;
+				cudaMemcpyToSymbol(d_cons_centers, h_centers_new + step_constant*max_cached_constant*clusterDimension, clusterDimension*num_copy_constant*sizeof(float));
 				cudaDeviceSynchronize();
-				calc_distance_mixed << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_clusterIdx,
-					d_mindistances, step, num_copy, max_cached);
+				calc_distance_constant << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_clusterIdx,
+					d_mindistances, step_constant, num_copy_constant, max_cached_constant);
 				cudaDeviceSynchronize();
 
 
@@ -408,8 +612,8 @@ int main(int argc, char **argv){
 			/*
 			int zero_count = 0;
 			for (int i = 0; i < numClusters; i++){
-				if (h_member_counter[i] == 0)
-					zero_count++;
+			if (h_member_counter[i] == 0)
+			zero_count++;
 			}
 			printf("Zero Count = %d\n", zero_count);*/
 			member_division(h_centers_new, h_member_counter);
@@ -423,6 +627,7 @@ int main(int argc, char **argv){
 		kmeansclk2 = microtime();
 		printf("Kmeans Total Time = %g seconds\n\n", (double)((kmeansclk2 - kmeansclk1) / 1000000));
 
+		/*Use the GPU to add array if the number of elements is high enough!*/
 #if numPoints > 64*1024*1024
 		add_array << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_mindistances);
 		cudaMemcpy(h_mindistances, d_mindistances, numPoints*sizeof(float), cudaMemcpyDeviceToHost);

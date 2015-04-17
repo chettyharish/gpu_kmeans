@@ -9,7 +9,7 @@
 #include <math.h>
 #include <time.h>
 
-#define iterations 1						// Max times to run kmeans
+#define iterations 10						// Max times to run kmeans
 #define convergecount 20					// Max kmeans step to avoid flip-flops
 #define clusterDimension 16
 #define numPoints (1*1024*1024)
@@ -242,6 +242,87 @@ __global__ void calc_distance_transpose_unused(float *d_points, int *d_clusterId
 	}
 }
 
+
+__global__ void generate_new_center_transpose_unused(float *d_points, float *d_centers, int *d_clusterIdx, int * d_member_counter){
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	if (i < numPoints){
+		int clusterId = d_clusterIdx[i];
+		for (int j = 0; j < clusterDimension; j++){
+			atomicAdd(&d_centers[clusterDimension*clusterId + j], d_points[j*numPoints + i]);
+		}
+		atomicAdd(&d_member_counter[clusterId], 1);
+	}
+
+}
+
+__global__ void generate_new_center2_unused(float *d_points, float *d_centers, int *d_clusterIdx, int *d_member_counter, int split_steps, int split_size){
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	int tx = threadIdx.x;
+	extern __shared__ float s_centers[];
+	if (i < numPoints){
+		int clusterId = d_clusterIdx[i];
+		float points[clusterDimension];
+		for (int j = 0; j < clusterDimension; j++){
+			points[j] = d_points[i*clusterDimension + j];
+		}
+
+
+		for (int j = 0; j < split_steps; j++){
+			/*
+			0*3 -> 0 to 2
+			1*3 -> 3 to 5
+			2*3 -> 6 to 8
+			3*3 -> 9 to 11
+			4*3 -> 12 to 14
+			5*3 -> 15 to 17
+			end   -> 15 , 16 , 17 , 18
+			start -> 13 , 14 , 15 , 16
+			diff  ->  3  , 2  , 1  , 0
+			*/
+			__syncthreads();
+			int max_length;
+			int end_point = (j + 1)*split_size - 1;
+			if (end_point <= clusterDimension - 1){
+				max_length = split_size;
+			}
+			else{
+				max_length = clusterDimension - j*split_size;
+			}
+
+			/*Collabaratively Load 0's in shared memory!*/
+			/*Each thread 0's out ele_to_zero entries*/
+			int ele_to_zero = ceil((48 * 1024) / (4.0 * blockDim.x));
+			if (tx == 0){
+				for (int k = 0; k < 48 * 1024 / 4; k++){
+					s_centers[k] = 0;
+				}
+			}
+
+
+
+			__syncthreads();
+
+			for (int k = 0; k < max_length; k++){
+				atomicAdd(&s_centers[max_length*clusterId + k], points[k]);
+			}
+			__syncthreads();
+
+			if (tx == 0){
+				for (int l = 0; l < numClusters; l++){
+					for (int k = 0; k < max_length; k++){
+						atomicAdd(&d_centers[j*split_size + clusterDimension*l + k], s_centers[max_length*l + k]);
+					}
+				}
+			}
+
+			__syncthreads();
+
+		}
+
+		atomicAdd(&d_member_counter[clusterId], 1);
+	}
+}
+
 ////////////////////////////////////////////////////////////////////////
 ////////////////////////UNUSED CODE ENDS///////////////////////////////
 ////////////////////////////////////////////////////////////////////////
@@ -399,60 +480,76 @@ __global__ void calc_distance_constant(float *d_points, int *d_clusterIdx, float
 	}
 }
 
-__global__ void calc_distance_shared(float *d_points, float *d_centers, int *d_clusterIdx, float *d_mindistances, int step_shared, int num_copy_shared, int max_cached_shared){
-
-	int i = blockDim.x*blockIdx.x + threadIdx.x;
-	int tx = threadIdx.x;
-	extern __shared__ float s_centers[];
-
-
-	if (tx < max_cached_shared){
-		for (int j = 0; j < clusterDimension; j++){
-			s_centers[tx*clusterDimension + j] = d_centers[step_shared*max_cached_shared*clusterDimension + tx*clusterDimension + j];
-		}
-	}
-
-
-	if (i < numPoints){
-		int min_pos = -1;
-		float min_dist = d_mindistances[i];
-		float old_min_dist = d_mindistances[i];
-
-		float points[clusterDimension];
-		for (int j = 0; j < clusterDimension; j++){
-			points[j] = d_points[j*numPoints + i];
-		}
-
-		/*for (int k = 0; k < num_copy; k++){
-			float distance = 0.0f;
-			for (int j = 0; j < clusterDimension; j++){
-				distance += fabsf(s_points[tx*clusterDimension + j] - d_cons_centers[k*clusterDimension + j]);
-			}
-
-			if (distance < min_dist){
-				min_dist = distance;
-				min_pos = k;
-			}
-		}
-
-		if (min_dist < old_min_dist){
-			d_mindistances[i] = min_dist;
-			d_clusterIdx[i] = step*max_cached + min_pos;
-		}*/
-	}
-}
-
 
 __global__ void generate_new_center_transpose(float *d_points, float *d_centers, int *d_clusterIdx, int * d_member_counter){
 	int i = blockDim.x*blockIdx.x + threadIdx.x;
 	if (i < numPoints){
 		int clusterId = d_clusterIdx[i];
+		float points[clusterDimension];
 		for (int j = 0; j < clusterDimension; j++){
-			atomicAdd(&d_centers[clusterDimension*clusterId + j], d_points[j*numPoints + i]);
+			points[j] = d_points[j*numPoints + i];
+		}
+		for (int j = 0; j < clusterDimension; j++){
+			atomicAdd(&d_centers[clusterDimension*clusterId + j], points[j]);
 		}
 		atomicAdd(&d_member_counter[clusterId], 1);
 	}
 
+}
+
+__global__ void generate_new_center_shared(float *d_points, float *d_centers, int *d_clusterIdx, int *d_member_counter, int split_steps, int split_size){
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	extern __shared__ float s_centers[];
+	if (i < numPoints){
+		int clusterId = d_clusterIdx[i];
+		int tx = threadIdx.x;
+		float points[clusterDimension];
+
+		for (int j = 0; j < clusterDimension; j++){
+			points[j] = d_points[j*numPoints + i];
+		}
+
+
+		for (int j = 0; j < split_steps; j++){
+			__syncthreads();
+			int max_length;
+			int end_point = (j + 1)*split_size - 1;
+			if (end_point <= clusterDimension - 1){
+				max_length = split_size;
+			}
+			else{
+				max_length = clusterDimension - j*split_size;
+			}
+
+			/*Collabaratively Load 0's in shared memory!*/
+			/*We know it has (24*1024/4)) floats*/
+			/*So each thread has to zero out 6 elements*/
+			for (int k = 0; k < 6; k++){
+				s_centers[6*tx + k] = 0;
+			}
+			__syncthreads();
+
+
+
+			for (int k = 0; k < max_length; k++){
+				atomicAdd(&s_centers[max_length*clusterId + k], points[j*split_size + k]);
+			}
+			__syncthreads();
+
+			if (tx == 0){
+				for (int l = 0; l < numClusters; l++){
+					for (int k = 0; k < max_length; k++){
+						atomicAdd(&d_centers[j*split_size + clusterDimension*l + k], s_centers[max_length*l + k]);
+					}
+				}
+			}
+
+			__syncthreads();
+
+		}
+
+		atomicAdd(&d_member_counter[clusterId], 1);
+	}
 }
 
 __global__ void add_array(float *d_mindistances)
@@ -497,15 +594,10 @@ int main(int argc, char **argv){
 	int *d_clusterIdx, *d_member_counter;
 	float diff_norm = (float)FLOAT_MAX;
 
-	//Calculations for calc_distance()
-	/*Block fitting*/
-	int ThreadsPerBlock = 1024;
-	if ((48 * 1024) / (clusterDimension*sizeof(float)) < 1024)
-		ThreadsPerBlock = (48 * 1024) / (clusterDimension*sizeof(float));
-	int NumBlocks = (int)ceil(numPoints*1.0f / ThreadsPerBlock);
 
-	/*Shared memory max fitting*/
-	int smem_size = ThreadsPerBlock*clusterDimension*sizeof(float);
+	/*Shared memory max fitting , Ensuring 2 blocks fitting at a time*/
+	int smem_size = 24 * 1024;
+
 
 	/*Constant memory max fitting*/
 	int max_cached_constant, distance_steps_constant;
@@ -520,14 +612,14 @@ int main(int argc, char **argv){
 
 	distance_steps_constant = (int)ceil(numClusters*1.0f / max_cached_constant*1.0f);
 	printf("Calculations for max_distance() function!\n");
-	printf("numClusters = %d \tThreadsPerBlock = %d \t NumBlocks = %d\t smem_size = %d\n", numClusters, ThreadsPerBlock, NumBlocks, smem_size);
-	printf("max_cached %d\t distance_steps %d\n\n", max_cached_constant, distance_steps_constant);
+	printf("smem_size = %d\t max_cached %d\t distance_steps %d\n\n", smem_size,max_cached_constant, distance_steps_constant);
 
 	//Calculations for generate_new_centers()
-	int split_size = (int)floor((48 * 1024) / (numClusters * 4.0f));
+	int split_size = (int)floor((24 * 1024) / (numClusters * 4.0f));
 	int split_steps = (int)ceil(clusterDimension *1.0f / split_size);
 	printf("Calculations for generate_new_centers() function!\n");
 	printf("split_size = %d \t split_steps = %d \n\n", split_size, split_steps);
+
 
 	/*Stores the points*/
 	float *h_points = (float *)malloc(clusterDimension*numPoints*sizeof(float));
@@ -544,6 +636,9 @@ int main(int argc, char **argv){
 	/*Consists number of members in a clusters*/
 	int *h_member_counter = (int *)malloc(numClusters*sizeof(int));
 
+	/*Changing preference to L1Cache for both the kernels*/
+	cudaFuncSetCacheConfig(calc_distance_constant, cudaFuncCachePreferL1);
+	cudaFuncSetCacheConfig(generate_new_center_transpose, cudaFuncCachePreferL1);
 	cudaMalloc((void**)& d_points, clusterDimension*numPoints*sizeof(float));
 	cudaMalloc((void**)& d_centers, clusterDimension*numClusters*sizeof(float));
 	cudaMalloc((void**)& d_mindistances, numPoints*sizeof(float));
@@ -595,7 +690,9 @@ int main(int argc, char **argv){
 
 			clk1 = microtime();
 			cudaMemset(d_centers, 0, clusterDimension*numClusters*sizeof(float));
-			generate_new_center_transpose << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_centers, d_clusterIdx, d_member_counter);
+			//generate_new_center_transpose << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_centers, d_clusterIdx, d_member_counter);
+			generate_new_center_shared << <(int)ceil(numPoints / 1024.0), 1024 , smem_size >> >(d_points, d_centers, d_clusterIdx, d_member_counter, split_steps, split_size);
+
 			cudaDeviceSynchronize();
 			//printf("generate_new_center_transpose: %s\n", cudaGetErrorString(cudaGetLastError()));
 			clk2 = microtime();

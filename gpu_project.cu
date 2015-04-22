@@ -13,7 +13,7 @@
 #define convergecount 20					// Max kmeans step to avoid flip-flops
 #define clusterDimension 16
 #define numPoints (1*1024*1024)
-#define numClusters (1024)
+#define numClusters (3*1024)
 #define FLOAT_MAX 1e+37
 #define ConstantMemFloats (64*1024)/4			//	64KB/4
 #define SharedMemFloats (24*1024)/4				//	24KB/4 
@@ -21,7 +21,7 @@
 
 
 #define PC 1
-#if PC == 0
+#if PC == 1
 /*Works on Windows!*/
 double microtime() { return (double)time(NULL); }
 #else
@@ -358,6 +358,25 @@ __host__ void printDeviceInfo(){
 	fclose(fp);
 }
 
+__host__ void create_input_file(){
+	/*Writes the input to a file for testing with other codes*/
+	int count = 0;
+	FILE * fp;
+	fp = fopen("data.txt", "w");
+	for (int i = 0; i < numPoints; i++)
+	{
+		fprintf(fp, "%d ", i);
+		for (int j = 0; j < clusterDimension; j++)
+		{
+			if (j != clusterDimension - 1)
+				fprintf(fp, "%d ", count);
+			else
+				fprintf(fp, "%d\n", count);
+			count++;
+		}
+
+	}
+}
 
 __host__ void generate_random_points_transpose(float *h_points){
 	/*Avoiding rand() since its not truly random*/
@@ -368,7 +387,7 @@ __host__ void generate_random_points_transpose(float *h_points){
 	for (int j = 0; j < clusterDimension; j++)
 	{
 		for (int i = 0; i < numPoints; i++){
-			h_points[j*numPoints + i] = (float)(rand() % rand_range);
+			//h_points[j*numPoints + i] = (float)(rand() % rand_range);
 			h_points[j*numPoints + i] = (float)(count++);
 		}
 	}
@@ -497,6 +516,27 @@ __global__ void generate_new_center_transpose(float *d_points, float *d_centers,
 
 }
 
+__global__ void add_member_counts(int *d_clusterIdx, int * d_member_counter){
+	int i = blockDim.x*blockIdx.x + threadIdx.x;
+	extern __shared__ float s_member_counter[];
+	if (i < numPoints){
+		int clusterId = d_clusterIdx[i];
+		int tx = threadIdx.x;
+
+		int member_counts_to_load = numClusters / 1024.0;
+		for (int l = tx; l < tx + member_counts_to_load; l++){
+			s_member_counter[l] = 0;
+		}
+		__syncthreads();
+		atomicAdd(&s_member_counter[clusterId], 1);
+		__syncthreads();
+
+		for (int l = tx; l < tx + member_counts_to_load; l++){
+			atomicAdd(&d_member_counter[l], s_member_counter[l]);
+		}
+	}
+}
+
 __global__ void generate_new_center_shared(float *d_points, float *d_centers, int *d_clusterIdx, int *d_member_counter, int split_steps, int split_size){
 	int i = blockDim.x*blockIdx.x + threadIdx.x;
 	extern __shared__ float s_centers[];
@@ -525,25 +565,28 @@ __global__ void generate_new_center_shared(float *d_points, float *d_centers, in
 			/*We know it has (24*1024/4)) floats*/
 			/*So each thread has to zero out 6 elements*/
 			for (int k = 0; k < 6; k++){
-				s_centers[6*tx + k] = 0;
+				s_centers[6 * tx + k] = 0;
 			}
 			__syncthreads();
-
-
 
 			for (int k = 0; k < max_length; k++){
 				atomicAdd(&s_centers[max_length*clusterId + k], points[j*split_size + k]);
 			}
 			__syncthreads();
 
-			if (tx == 0){
-				for (int l = 0; l < numClusters; l++){
-					for (int k = 0; k < max_length; k++){
-						atomicAdd(&d_centers[j*split_size + clusterDimension*l + k], s_centers[max_length*l + k]);
-					}
+
+
+			/*Threads must collabaratively writeback to d_centers , where each thread takes out one center*/
+			/*Each thread must writeback max_length elements to d_centers*/
+			/*Threads must only writeback 24K in total!!! must be careful of centers < threads*/
+			/*Number of centers will be greater than number of threads!*/
+
+			int num_cluster_to_writeback = numClusters / 1024.0;
+			for (int l = tx; l < tx + num_cluster_to_writeback; l++){
+				for (int k = 0; k < max_length; k++){
+					atomicAdd(&d_centers[j*split_size + clusterDimension*l + k], s_centers[max_length*l + k]);
 				}
 			}
-
 			__syncthreads();
 
 		}
@@ -579,6 +622,8 @@ __global__ void add_array(float *d_mindistances)
 int main(int argc, char **argv){
 
 	printDeviceInfo();
+	create_input_file();
+	exit(1);
 	double clk1, clk2, mclk1, mclk2, kmeansclk1, kmeansclk2;
 	mclk1 = microtime();
 
@@ -612,7 +657,7 @@ int main(int argc, char **argv){
 
 	distance_steps_constant = (int)ceil(numClusters*1.0f / max_cached_constant*1.0f);
 	printf("Calculations for max_distance() function!\n");
-	printf("smem_size = %d\t max_cached %d\t distance_steps %d\n\n", smem_size,max_cached_constant, distance_steps_constant);
+	printf("smem_size = %d\t max_cached %d\t distance_steps %d\n\n", smem_size, max_cached_constant, distance_steps_constant);
 
 	//Calculations for generate_new_centers()
 	int split_size = (int)floor((24 * 1024) / (numClusters * 4.0f));
@@ -639,6 +684,8 @@ int main(int argc, char **argv){
 	/*Changing preference to L1Cache for both the kernels*/
 	cudaFuncSetCacheConfig(calc_distance_constant, cudaFuncCachePreferL1);
 	cudaFuncSetCacheConfig(generate_new_center_transpose, cudaFuncCachePreferL1);
+	cudaFuncSetCacheConfig(generate_new_center_shared, cudaFuncCachePreferShared);
+
 	cudaMalloc((void**)& d_points, clusterDimension*numPoints*sizeof(float));
 	cudaMalloc((void**)& d_centers, clusterDimension*numClusters*sizeof(float));
 	cudaMalloc((void**)& d_mindistances, numPoints*sizeof(float));
@@ -658,16 +705,12 @@ int main(int argc, char **argv){
 		generate_random_centers_transpose(h_points, h_centers_old, h_centers_new);
 		/*Each co-ordinate has a change less than 0.001 on average!*/
 		kmeansclk1 = microtime();
-		while (diff_norm >(numPoints*clusterDimension) / 1000.0 && con_count < convergecount){
+		while (diff_norm > (numPoints*clusterDimension) / 1000.0 && con_count < convergecount){
 			printf("\nIteration = %d \t Ccount = %d\n", count, con_count);
 			clk1 = microtime();
 			cudaMemset(d_clusterIdx, 1, numPoints*sizeof(int));
 			cudaMemset(d_mindistances, 99, numPoints*sizeof(float));
 			cudaMemset(d_member_counter, 0, numClusters*sizeof(int));
-			/*
-			cudaMemcpy(d_clusterIdx, h_clusterIdx, numPoints*sizeof(int), cudaMemcpyHostToDevice);
-			cudaMemcpy(d_mindistances, h_mindistances, numPoints*sizeof(float), cudaMemcpyHostToDevice);
-			cudaMemcpy(d_member_counter, h_member_counter, numClusters*sizeof(int), cudaMemcpyHostToDevice);*/
 			cudaDeviceSynchronize();
 			clk2 = microtime();
 			printf("PART 1 :Time = %g µs\n", (double)(clk2 - clk1));
@@ -690,8 +733,10 @@ int main(int argc, char **argv){
 
 			clk1 = microtime();
 			cudaMemset(d_centers, 0, clusterDimension*numClusters*sizeof(float));
-			//generate_new_center_transpose << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_centers, d_clusterIdx, d_member_counter);
-			generate_new_center_shared << <(int)ceil(numPoints / 1024.0), 1024 , smem_size >> >(d_points, d_centers, d_clusterIdx, d_member_counter, split_steps, split_size);
+			cudaDeviceSynchronize();
+			generate_new_center_transpose << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_points, d_centers, d_clusterIdx, d_member_counter);
+			//add_member_counts << <(int)ceil(numPoints / 1024.0), 1024, smem_size >> >(d_clusterIdx , d_member_counter);
+			//generate_new_center_shared << <(int)ceil(numPoints / 1024.0), 1024, smem_size >> >(d_points, d_centers, d_clusterIdx, d_member_counter, split_steps, split_size);
 
 			cudaDeviceSynchronize();
 			//printf("generate_new_center_transpose: %s\n", cudaGetErrorString(cudaGetLastError()));
@@ -706,13 +751,18 @@ int main(int argc, char **argv){
 			printf("PART 4 :Time = %g µs\n", (double)(clk2 - clk1));
 
 			clk1 = microtime();
-			/*
+
+			/*Handling overlapping centers*/
 			int zero_count = 0;
 			for (int i = 0; i < numClusters; i++){
-			if (h_member_counter[i] == 0)
-			zero_count++;
+				if (h_member_counter[i] == 0)
+					/*Since the center itself is one member*/
+					/*The logic will end up selecting the first overlapping center otherwise*/
+					h_member_counter[i]++;
 			}
-			printf("Zero Count = %d\n", zero_count);*/
+			printf("Zero Count = %d\n", zero_count);
+
+
 			member_division(h_centers_new, h_member_counter);
 			diff_norm = calculate_norm(h_centers_old, h_centers_new);
 			copy_centers(h_centers_old, h_centers_new);
@@ -725,7 +775,7 @@ int main(int argc, char **argv){
 		printf("Kmeans Total Time = %g seconds\n\n", (double)((kmeansclk2 - kmeansclk1) / 1000000));
 
 		/*Use the GPU to add array if the number of elements is high enough!*/
-#if numPoints > 64*1024*1024
+#if numPoints > 32*1024*1024
 		add_array << <(int)ceil(numPoints / 1024.0), 1024 >> >(d_mindistances);
 		cudaMemcpy(h_mindistances, d_mindistances, numPoints*sizeof(float), cudaMemcpyDeviceToHost);
 		cudaDeviceSynchronize();
@@ -754,7 +804,7 @@ int main(int argc, char **argv){
 		diff_norm = (float)FLOAT_MAX;
 		count++;
 
-	}
+		}
 
 
 	FILE * fp;

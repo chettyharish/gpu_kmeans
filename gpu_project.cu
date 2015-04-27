@@ -9,11 +9,12 @@
 #include <math.h>
 #include <time.h>
 
+#define dist_measure 1						// 0 for Manhattan, 1 for Euclidean
 #define iterations 10						// Max times to run kmeans
 #define convergecount 20					// Max kmeans step to avoid flip-flops
 #define clusterDimension 16
 #define numPoints (1*1024*1024)
-#define numClusters (3*1024)
+#define numClusters (1024)
 #define FLOAT_MAX 1e+37
 #define ConstantMemFloats (64*1024)/4			//	64KB/4
 #define SharedMemFloats (24*1024)/4				//	24KB/4 
@@ -21,7 +22,7 @@
 
 
 #define PC 1
-#if PC == 1
+#if PC == 0
 /*Works on Windows!*/
 double microtime() { return (double)time(NULL); }
 #else
@@ -480,10 +481,25 @@ __global__ void calc_distance_constant(float *d_points, int *d_clusterIdx, float
 
 		for (int k = 0; k < num_copy_constant; k++){
 			float distance = 0.0f;
-			for (int j = 0; j < clusterDimension; j++){
+			for (int j = 0; j < clusterDimension; j++){ 
+#if dist_measure == 0
+				/*Manhattan distance*/
 				distance += fabsf(points[j] - d_cons_centers[k*clusterDimension + j]);
+#elif dist_measure == 1
+				/*Euclidean distance*/
+				distance += (points[j] - d_cons_centers[k*clusterDimension + j])*
+									(points[j] - d_cons_centers[k*clusterDimension + j]);
+#elif dist_measure == 2
+				/*Hamming distance*/
+				if (points[j] != d_cons_centers[k*clusterDimension + j])
+					distance++;
+#endif
 			}
 
+#if dist_measure == 1
+				/*Euclidean distance*/
+				distance = sqrtf(distance);
+#endif
 			if (distance < min_dist){
 				min_dist = distance;
 				min_pos = k;
@@ -623,7 +639,6 @@ int main(int argc, char **argv){
 
 	printDeviceInfo();
 	create_input_file();
-	exit(1);
 	double clk1, clk2, mclk1, mclk2, kmeansclk1, kmeansclk2;
 	mclk1 = microtime();
 
